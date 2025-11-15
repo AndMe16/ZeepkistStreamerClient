@@ -6,6 +6,8 @@ import traceback
 import signal
 import sys
 import random
+import msgpack
+
 
 WS_URL = "ws://localhost:8080"
 ws_global = None
@@ -13,22 +15,28 @@ ws_global = None
 latest_state = None
 waiting_state = False
 
+# websocket.enableTrace(True)
+
 def on_message(ws, message):
     try:
         global latest_state, waiting_state
-        latest_state = json.loads(message)
+        if isinstance(message, bytes):
+            latest_state = msgpack.unpackb(message, raw=False)
+            state = latest_state.get("state", {})
+            pos  = state.get("position", [0,0,0])
+            rot  = state.get("rotation", [0,0,0])
+            lv   = state.get("localVelocity", [0,0,0])
+            lav  = state.get("localAngularVelocity", [0,0,0])
+
+            # print("\n==== Received StreamData ====")
+            # print(f"Position           {pos}")
+            # print(f"Rotation (Euler)   {rot}")
+            # print(f"Local Velocity     {lv}")
+            # print(f"Local Ang Vel      {lav}")
+            # print(f"Timestamp          {latest_state.get('timestamp')}")
         waiting_state = False   # mark the state as received
 
-        # pos  = data.get("position", {})
-        # rot  = data.get("rotation", {})
-        # lv   = data.get("localVelocity", {})
-        # lav  = data.get("localAngularVelocity", {})
-
-        # print("\n==== Received Data ====")
-        # print(f"Position:            {pos}")
-        # print(f"Rotation:            {rot}")
-        # print(f"Loc. Vel.:          {lv}")
-        # print(f"Loc. Ang. Vel.:     {lav}")
+        
 
     except Exception as e:
         print("Error processing the message:")
@@ -62,9 +70,10 @@ def on_open(ws):
 
             # Decide on action based on the latest state
             action = ml_policy(state)
+            packet = msgpack.packb(action, use_bin_type=True)
 
             # Send the action
-            send_input(ws, action)
+            send_input(ws, packet)
 
             elapsed = time.time() - start
             remaining = dt - elapsed
@@ -97,18 +106,22 @@ def connect_with_retries():
         time.sleep(3)
 
 def request_state(ws):
-    ws.send(json.dumps({ "cmd": "STATE_REQUEST" }))
+    payload = {"cmd": "STATE_REQUEST"}
+    packet = msgpack.packb(payload, use_bin_type=True)
+    ws.send(packet, opcode=websocket.ABNF.OPCODE_BINARY)
 
-def send_input(ws, action):
-    ws.send(json.dumps(action))
+    
+
+def send_input(ws, packet):
+    ws.send(packet, opcode=websocket.ABNF.OPCODE_BINARY)
 
 def ml_policy(state):
     return {
         "cmd": "ACTION",
-        "steer": random.uniform(-1, 1),   # random steering
-        "brake": random.random(),         # 0–1 brake
-        "armsUp": random.choice([0, 1]),  # random toggle
-        # "reset": random.choice([0, 1]),   # occasional reset
+        "steer": random.uniform(-1, 1),
+        "brake": random.random(),
+        "armsUp": random.random(),
+        "reset": 1 if random.random() < 0.1 else 0,
     }
 
 
