@@ -25,7 +25,7 @@ latest_cmd_lock = threading.Lock()
 vgpad = None
 
 # Tuning
-UPDATE_HZ = 20
+UPDATE_HZ = 60
 UPDATE_INTERVAL = 1.0 / UPDATE_HZ
 
 # ---------------- WebSocket callbacks ----------------
@@ -89,7 +89,7 @@ def sequence_thread(ws):
       - wait remaining time to maintain dt
     """
     global waiting_state, latest_state, latest_cmd
-    dt = 1.0 / UPDATE_HZ   # request rate: 20 Hz (tune as needed)
+    dt = UPDATE_INTERVAL  
     print("[SEQ] Sequence thread started (request rate {:.1f} Hz)".format(1.0/dt))
 
     # small warmup
@@ -185,7 +185,7 @@ def virtual_controller_loop():
             if latest_cmd is not None:
                 # copy for local use
                 cmd = dict(latest_cmd)
-
+        
         # default neutral
         steer = 0.0
         brake = 0.0
