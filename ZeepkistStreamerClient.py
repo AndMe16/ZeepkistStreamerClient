@@ -6,10 +6,6 @@ import traceback
 import signal
 import sys
 import random
-import json
-
-# vgamepad
-import vgamepad as vg
 
 WS_URL = "ws://localhost:8080"
 
@@ -17,12 +13,6 @@ WS_URL = "ws://localhost:8080"
 latest_state = None           # dict populated by on_message when StreamData is received
 waiting_state = False         # set True by sequence thread when it requested a state
 waiting_state_lock = threading.Lock()
-
-latest_cmd = None             # dict with latest ACTION decided locally
-latest_cmd_lock = threading.Lock()
-
-# Virtual gamepad
-vgpad = None
 
 # Tuning
 UPDATE_HZ = 60
@@ -37,15 +27,14 @@ def on_message(ws, message):
     global latest_state, waiting_state
     try:
         if isinstance(message, bytes):
-            obj = msgpack.unpackb(message, raw=False)
+            latest_state = msgpack.unpackb(message, raw=False)
             # Expecting StreamData shaped like {"state": {...}, "timestamp": ...}
             # Save it
-            latest_state = obj
-            state = latest_state.get("state", {})
-            pos  = state.get("position", [0,0,0])
-            rot  = state.get("rotation", [0,0,0])
-            lv   = state.get("localVelocity", [0,0,0])
-            lav  = state.get("localAngularVelocity", [0,0,0])
+            # state = latest_state.get("state", {})
+            # pos  = state.get("position", [0,0,0])
+            # rot  = state.get("rotation", [0,0,0])
+            # lv   = state.get("localVelocity", [0,0,0])
+            # lav  = state.get("localAngularVelocity", [0,0,0])
 
             # print("\n==== Received StreamData ====")
             # print(f"Position           {pos}")
@@ -88,7 +77,8 @@ def sequence_thread(ws):
       - store latest_cmd (thread-safe)
       - wait remaining time to maintain dt
     """
-    global waiting_state, latest_state, latest_cmd
+    global waiting_state, latest_state
+
     dt = UPDATE_INTERVAL  
     print("[SEQ] Sequence thread started (request rate {:.1f} Hz)".format(1.0/dt))
 
@@ -126,9 +116,8 @@ def sequence_thread(ws):
         # decide action based on state
         action = ml_policy(state_snapshot)
 
-        # update latest_cmd (thread-safe latest-wins)
-        with latest_cmd_lock:
-            latest_cmd = action
+        # Send ACTION message back to Unity
+        send_action(ws, action)
 
         # print("[SEQ] Decided action:", action)
 
@@ -152,117 +141,28 @@ def request_state(ws):
         print("[WS] send error in request_state()")
         traceback.print_exc()
 
-# ---------------- Virtual controller updater thread ----------------
-
-def clamp(v, a, b):
-    return max(a, min(b, v))
-
-def map_stick_x(v):
-    # v expected in -1..1 -> vgamepad left_joystick_float expects -1..1
-    return clamp(v if v is not None else 0.0, -1.0, 1.0)
-
-def map_trigger(v):
-    # v expected in 0..1 -> map to 0..255
-    x = clamp(v if v is not None else 0.0, 0.0, 1.0)
-    return int(x * 255)
-
-def virtual_controller_loop():
+def send_action(ws, action_dict):
     """
-    Runs at UPDATE_HZ. Reads latest_cmd and updates vgpad accordingly.
+    Serializes InputCommand → MessagePack and sends it.
     """
-    global vgpad, latest_cmd
-    if vgpad is None:
-        print("[VC] No virtual pad available; exiting controller loop.")
-        return
-
-    print("[VC] Virtual controller loop started at {:.1f} Hz".format(UPDATE_HZ))
-    last_reset_pressed = False
-    while True:
-        start = time.time()
-        # read latest_cmd
-        cmd = None
-        with latest_cmd_lock:
-            if latest_cmd is not None:
-                # copy for local use
-                cmd = dict(latest_cmd)
-        
-        # default neutral
-        steer = 0.0
-        brake = 0.0
-        armsUp = 0.0
-        reset = 0.0
-
-        if cmd is not None and cmd.get("cmd") == "ACTION":
-            steer = float(cmd.get("steer", 0.0))
-            brake = float(cmd.get("brake", 0.0))
-            armsUp = float(cmd.get("armsUp", 0.0))
-            reset = float(cmd.get("reset", 0.0))
-
-        # map steer -> left stick X
-        sx = map_stick_x(steer)
-        sy = 0.0
-        try:
-            vgpad.left_joystick_float(sx, sy)
-        except Exception:
-            # some vgamepad versions use different method names; handle gracefully
-            try:
-                # integer API fallback (if available)
-                # map -1..1 -> -32767..32767
-                ix = int(sx * 32767)
-                iy = 0
-                vgpad.left_joystick(ix, iy)
-            except Exception:
-                print("[VC] left_joystick update failed; check vgamepad API")
-                traceback.print_exc()
-
-        # map brake -> left trigger
-        try:
-            vgpad.left_trigger(map_trigger(brake))
-        except Exception:
-            print("[VC] left_trigger failed")
-            traceback.print_exc()
-
-        # map armsUp -> right trigger
-        try:
-            vgpad.right_trigger(map_trigger(armsUp))
-        except Exception:
-            print("[VC] right_trigger failed")
-            traceback.print_exc()
-
-        # map reset -> Y button (simple threshold)
-        if reset > 0.5:
-            vgpad.press_button(vg.XUSB_BUTTON.XUSB_GAMEPAD_Y)
-            last_reset_pressed = True
-        else:
-            if last_reset_pressed:
-                vgpad.release_button(vg.XUSB_BUTTON.XUSB_GAMEPAD_Y)
-                last_reset_pressed = False
-
-        # Finally push to driver
-        try:
-            vgpad.update()
-        except Exception:
-            print("[VC] vgpad.update() raised exception")
-            traceback.print_exc()
-
-        elapsed = time.time() - start
-        sleep_t = UPDATE_INTERVAL - elapsed
-        if sleep_t > 0:
-            time.sleep(sleep_t)
-        else:
-            time.sleep(0.001)
-
-# ---------------- create virtual pad ----------------
-
-def create_virtual_x360():
     try:
-        pad = vg.VX360Gamepad()
-        print("[VC] Virtual X360 created")
-        return pad
+        payload = {
+            "cmd": action_dict["cmd"],
+            "steer": float(action_dict["steer"]),
+            "brake": float(action_dict["brake"]),
+            "armsUp": float(action_dict["armsUp"]),
+            "reset": float(action_dict["reset"]),
+        }
+
+        packet = msgpack.packb(payload, use_bin_type=True)
+        ws.send(packet, opcode=websocket.ABNF.OPCODE_BINARY)
+
     except Exception:
-        print("[VC] Failed creating virtual X360. Ensure ViGEmBus is installed and you're running as admin.")
+        print("[WS] Error sending ACTION")
         traceback.print_exc()
-        return None
+
+
+
 
 # ---------------- ML policy (replace with your model) ----------------
 
@@ -283,20 +183,13 @@ def ml_policy(state):
 # ---------------- cleanup and main ----------------
 
 ws_global = None
-vc_thread = None
 
 def cleanup(sig=None, frame=None):
-    global ws_global, vgpad
+    global ws_global
     print("\n[EXIT] Cleaning up...")
     try:
         if ws_global:
             ws_global.close()
-    except:
-        pass
-    try:
-        if vgpad:
-            vgpad.reset()
-            vgpad = None
     except:
         pass
     sys.exit(0)
@@ -305,17 +198,8 @@ signal.signal(signal.SIGINT, cleanup)
 signal.signal(signal.SIGTERM, cleanup)
 
 def start():
-    global vgpad, vc_thread, ws_global
+    global ws_global
 
-    # create virtual pad
-    vgpad = create_virtual_x360()
-    if vgpad is None:
-        print("Virtual pad creation failed; exiting.")
-        return
-
-    # start virtual controller thread
-    vc_thread = threading.Thread(target=virtual_controller_loop, daemon=True)
-    vc_thread.start()
 
     # create websocket client and connect
     ws_global = websocket.WebSocketApp(
